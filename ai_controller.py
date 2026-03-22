@@ -12,11 +12,14 @@ class AIController:
         self.api_key = api_key.strip()
         self.url = "https://integrate.api.nvidia.com/v1/chat/completions"
         self.model = "qwen/qwen3.5-122b-a10b"
-        self.fail_count = 0
 
+        self.fail_count = 0
         self.request_timeout_seconds = 30
         self.max_requests_per_minute = 40
         self.request_times = deque()
+
+        self.last_recovery_check = 0.0
+        self.recovery_check_interval = 20.0
 
         if self.api_key:
             self.greenhouse.ai_enabled = True
@@ -29,10 +32,11 @@ class AIController:
         if not self.greenhouse.ai_enabled:
             return
 
-        if not self.greenhouse.internet_ok:
+        if self.greenhouse.fallback_mode:
+            self._try_restore_from_fallback()
             return
 
-        if self.greenhouse.fallback_mode:
+        if not self.greenhouse.internet_ok:
             return
 
         all_failed = True
@@ -58,6 +62,58 @@ class AIController:
             self.greenhouse.internet_ok = False
             self.greenhouse.fallback_mode = True
             self._add_event("ИИ недоступен несколько запросов подряд. Система перешла в резервный режим.")
+
+    def _try_restore_from_fallback(self):
+        now = time.monotonic()
+
+        if now - self.last_recovery_check < self.recovery_check_interval:
+            return
+
+        self.last_recovery_check = now
+
+        try:
+            ok = self._ping_ai()
+
+            if ok:
+                self.greenhouse.internet_ok = True
+                self.greenhouse.fallback_mode = False
+                self.fail_count = 0
+                self._add_event("Связь с ИИ восстановлена. Система вернулась в основной режим.")
+        except Exception:
+            pass
+
+    def _ping_ai(self) -> bool:
+        if not self._can_send_request():
+            return False
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "Отвечай только JSON."},
+                {"role": "user", "content": '{"ok":true}'},
+            ],
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "top_p": 0.1,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+        self._register_request()
+
+        response = requests.post(
+            self.url,
+            headers=headers,
+            json=payload,
+            timeout=self.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        return True
 
     def _can_send_request(self) -> bool:
         now = time.monotonic()
