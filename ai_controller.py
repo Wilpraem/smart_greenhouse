@@ -1,6 +1,8 @@
 import json
-import requests
+import time
+from collections import deque
 
+import requests
 from models import GreenhouseState, PlantUnit
 
 
@@ -11,6 +13,10 @@ class AIController:
         self.url = "https://integrate.api.nvidia.com/v1/chat/completions"
         self.model = "qwen/qwen3.5-122b-a10b"
         self.fail_count = 0
+
+        self.request_timeout_seconds = 30
+        self.max_requests_per_minute = 40
+        self.request_times = deque()
 
         if self.api_key:
             self.greenhouse.ai_enabled = True
@@ -29,18 +35,19 @@ class AIController:
         if self.greenhouse.fallback_mode:
             return
 
-        if not self.greenhouse.power_ok or not self.greenhouse.sensor_ok:
-            return
-
         all_failed = True
 
         for unit in self.greenhouse.plants.values():
+            if not self._can_send_request():
+                self._add_event("Достигнут лимит 40 запросов в минуту. ИИ временно пропущен.")
+                break
+
             try:
                 decision = self._ask_ai(unit)
                 self._apply_decision(unit, decision)
                 all_failed = False
             except Exception:
-                self._add_event(f"{unit.profile.name}: ИИ временно не ответил")
+                self._add_event(f"{unit.profile.name}: ИИ временно не ответил, решение пропущено")
 
         if all_failed:
             self.fail_count += 1
@@ -51,6 +58,17 @@ class AIController:
             self.greenhouse.internet_ok = False
             self.greenhouse.fallback_mode = True
             self._add_event("ИИ недоступен несколько запросов подряд. Система перешла в резервный режим.")
+
+    def _can_send_request(self) -> bool:
+        now = time.monotonic()
+
+        while self.request_times and now - self.request_times[0] >= 60:
+            self.request_times.popleft()
+
+        return len(self.request_times) < self.max_requests_per_minute
+
+    def _register_request(self):
+        self.request_times.append(time.monotonic())
 
     def _ask_ai(self, unit: PlantUnit):
         profile = unit.profile
@@ -63,8 +81,9 @@ class AIController:
 
         system_text = (
             "Ты управляешь умной оранжереей. "
-            "Отвечай только JSON без markdown. "
-            'Формат: {"watering": true, "lighting": false, "fan": false, "reason": "кратко"}'
+            "Отвечай только JSON без markdown и без пояснений. "
+            "Формат ответа: "
+            "{\"watering\": true, \"lighting\": false, \"fan\": false, \"reason\": \"кратко\"}"
         )
 
         user_text = (
@@ -72,6 +91,7 @@ class AIController:
             f"Температура: {state.temperature:.1f}\n"
             f"Мин температура: {profile.temp_min}\n"
             f"Макс температура: {profile.temp_max}\n"
+            f"Влажность воздуха: {state.air_humidity:.1f}\n"
             f"Влажность почвы: {state.soil_moisture:.1f}\n"
             f"Мин влажность почвы: {profile.soil_min}\n"
             f"Макс влажность почвы: {profile.soil_max}\n"
@@ -96,11 +116,19 @@ class AIController:
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
-        response = requests.post(self.url, headers=headers, json=payload, timeout=25)
+        self._register_request()
+
+        response = requests.post(
+            self.url,
+            headers=headers,
+            json=payload,
+            timeout=self.request_timeout_seconds,
+        )
         response.raise_for_status()
 
         data = response.json()
         content = data["choices"][0]["message"]["content"]
+
         return self._parse_json(content)
 
     def _parse_json(self, text: str):
@@ -115,7 +143,8 @@ class AIController:
         if start == -1 or end == -1:
             raise ValueError("ИИ не вернул JSON")
 
-        return json.loads(cleaned[start:end + 1])
+        json_text = cleaned[start:end + 1]
+        return json.loads(json_text)
 
     def _apply_decision(self, unit: PlantUnit, decision: dict):
         profile = unit.profile
@@ -144,19 +173,14 @@ class AIController:
             devices.fan_on = want_fan
             changes.append(f"вентилятор {'включён' if want_fan else 'выключен'}")
 
-        new_lamp_level = self._recommended_lamp_level(profile, state) if want_lamp else 0
-        if new_lamp_level != devices.lamp_level:
-            self._set_lamp_level(devices, new_lamp_level)
-            changes.append(f"лампа {new_lamp_level}%")
+        if want_lamp != devices.lamp_on:
+            devices.lamp_on = want_lamp
+            changes.append(f"лампа {'включена' if want_lamp else 'выключена'}")
 
         if want_pump:
-            if self.greenhouse.water_tank_ok:
-                devices.pump_on = True
-                state.last_watering_tick = self.greenhouse.tick
-                changes.append("полив включён")
-            else:
-                self._add_event(f"{profile.name}: ИИ запросил полив, но воды нет")
-                devices.pump_on = False
+            devices.pump_on = True
+            state.last_watering_tick = self.greenhouse.tick
+            changes.append("полив включён")
         else:
             devices.pump_on = False
 
@@ -166,21 +190,5 @@ class AIController:
                 text += f". Причина: {reason}"
             self._add_event(text)
 
-    def _recommended_lamp_level(self, profile, state):
-        deficit = profile.light_min - state.light_level
-
-        if deficit >= 4000:
-            return 100
-        if deficit >= 2500:
-            return 70
-        if deficit >= 1200:
-            return 45
-        return 25
-
-    def _set_lamp_level(self, devices, level: int):
-        devices.lamp_level = max(0, min(100, int(level)))
-        devices.lamp_on = devices.lamp_level > 0
-
     def _add_event(self, text: str):
-        if not self.greenhouse.events or self.greenhouse.events[-1] != text:
-            self.greenhouse.events.append(text)
+        self.greenhouse.events.append(text)
