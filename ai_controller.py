@@ -3,7 +3,7 @@ import time
 from collections import deque
 
 import requests
-from models import GreenhouseState, PlantUnit
+from models import GreenhouseState
 
 
 class AIController:
@@ -39,24 +39,17 @@ class AIController:
         if not self.greenhouse.internet_ok:
             return
 
-        all_failed = True
+        if not self._can_send_request():
+            self._add_event("Достигнут лимит 40 запросов в минуту. ИИ временно пропущен.")
+            return
 
-        for unit in self.greenhouse.plants.values():
-            if not self._can_send_request():
-                self._add_event("Достигнут лимит 40 запросов в минуту. ИИ временно пропущен.")
-                break
-
-            try:
-                decision = self._ask_ai(unit)
-                self._apply_decision(unit, decision)
-                all_failed = False
-            except Exception:
-                self._add_event(f"{unit.profile.name}: ИИ временно не ответил, решение пропущено")
-
-        if all_failed:
-            self.fail_count += 1
-        else:
+        try:
+            decisions = self._ask_ai_for_all_plants()
+            self._apply_all_decisions(decisions)
             self.fail_count = 0
+        except Exception:
+            self.fail_count += 1
+            self._add_event("ИИ временно не ответил, решение пропущено")
 
         if self.fail_count >= 2:
             self.greenhouse.internet_ok = False
@@ -126,37 +119,46 @@ class AIController:
     def _register_request(self):
         self.request_times.append(time.monotonic())
 
-    def _ask_ai(self, unit: PlantUnit):
-        profile = unit.profile
-        state = unit.state
-
+    def _ask_ai_for_all_plants(self):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
         }
 
+        plants_data = []
+        for key, unit in self.greenhouse.plants.items():
+            profile = unit.profile
+            state = unit.state
+
+            plants_data.append({
+                "key": key,
+                "name": profile.name,
+                "temperature": round(state.temperature, 1),
+                "air_humidity": round(state.air_humidity, 1),
+                "soil_moisture": round(state.soil_moisture, 1),
+                "temp_min": profile.temp_min,
+                "temp_max": profile.temp_max,
+                "soil_min": profile.soil_min,
+                "soil_max": profile.soil_max,
+                "light_level": state.light_level,
+                "light_min": profile.light_min,
+                "light_today": state.light_today,
+                "light_goal": profile.light_goal,
+                "status": state.status,
+            })
+
         system_text = (
             "Ты управляешь умной оранжереей. "
-            "Отвечай только JSON без markdown и без пояснений. "
-            "Формат ответа: "
-            "{\"watering\": true, \"lighting\": false, \"fan\": false, \"reason\": \"кратко\"}"
+            "Тебе переданы сразу все растения. "
+            "Для каждого растения верни решение в JSON без markdown и без пояснений вне JSON. "
+            "Формат ответа строго такой: "
+            '{"decisions":[{"key":"orchid","watering":false,"lighting":true,"fan":false,"reason":"кратко"}]}'
         )
 
         user_text = (
-            f"Растение: {profile.name}\n"
-            f"Температура: {state.temperature:.1f}\n"
-            f"Мин температура: {profile.temp_min}\n"
-            f"Макс температура: {profile.temp_max}\n"
-            f"Влажность воздуха: {state.air_humidity:.1f}\n"
-            f"Влажность почвы: {state.soil_moisture:.1f}\n"
-            f"Мин влажность почвы: {profile.soil_min}\n"
-            f"Макс влажность почвы: {profile.soil_max}\n"
-            f"Освещённость: {state.light_level}\n"
-            f"Минимальный свет: {profile.light_min}\n"
-            f"Свет за день: {state.light_today}\n"
-            f"Цель света за день: {profile.light_goal}\n"
-            f"Статус: {state.status}\n"
-            "Реши, включать ли полив, лампу и вентилятор."
+            "Вот данные по всем растениям:\n"
+            f"{json.dumps(plants_data, ensure_ascii=False)}\n"
+            "Нужно отдельно принять решение для каждого растения."
         )
 
         payload = {
@@ -165,7 +167,7 @@ class AIController:
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
             ],
-            "max_tokens": 120,
+            "max_tokens": 500,
             "temperature": 0.2,
             "top_p": 0.7,
             "stream": False,
@@ -184,8 +186,13 @@ class AIController:
 
         data = response.json()
         content = data["choices"][0]["message"]["content"]
+        parsed = self._parse_json(content)
 
-        return self._parse_json(content)
+        decisions = parsed.get("decisions", [])
+        if not isinstance(decisions, list):
+            raise ValueError("ИИ вернул неверный формат decisions")
+
+        return decisions
 
     def _parse_json(self, text: str):
         cleaned = text.strip()
@@ -202,7 +209,20 @@ class AIController:
         json_text = cleaned[start:end + 1]
         return json.loads(json_text)
 
-    def _apply_decision(self, unit: PlantUnit, decision: dict):
+    def _apply_all_decisions(self, decisions: list):
+        decision_map = {}
+
+        for item in decisions:
+            key = item.get("key")
+            if key:
+                decision_map[key] = item
+
+        for key, unit in self.greenhouse.plants.items():
+            decision = decision_map.get(key)
+            if decision:
+                self._apply_decision(unit, decision)
+
+    def _apply_decision(self, unit, decision: dict):
         profile = unit.profile
         state = unit.state
         devices = unit.devices
@@ -229,14 +249,19 @@ class AIController:
             devices.fan_on = want_fan
             changes.append(f"вентилятор {'включён' if want_fan else 'выключен'}")
 
-        if want_lamp != devices.lamp_on:
-            devices.lamp_on = want_lamp
-            changes.append(f"лампа {'включена' if want_lamp else 'выключена'}")
+        new_lamp_level = self._recommended_lamp_level(profile, state) if want_lamp else 0
+        if new_lamp_level != devices.lamp_level:
+            self._set_lamp_level(devices, new_lamp_level)
+            changes.append(f"лампа {new_lamp_level}%")
 
         if want_pump:
-            devices.pump_on = True
-            state.last_watering_tick = self.greenhouse.tick
-            changes.append("полив включён")
+            if self.greenhouse.water_tank_ok:
+                devices.pump_on = True
+                state.last_watering_tick = self.greenhouse.tick
+                changes.append("полив включён")
+            else:
+                self._add_event(f"{profile.name}: ИИ запросил полив, но воды нет")
+                devices.pump_on = False
         else:
             devices.pump_on = False
 
@@ -245,6 +270,21 @@ class AIController:
             if reason:
                 text += f". Причина: {reason}"
             self._add_event(text)
+
+    def _recommended_lamp_level(self, profile, state):
+        deficit = profile.light_min - state.light_level
+
+        if deficit >= 4000:
+            return 100
+        if deficit >= 2500:
+            return 70
+        if deficit >= 1200:
+            return 45
+        return 25
+
+    def _set_lamp_level(self, devices, level: int):
+        devices.lamp_level = max(0, min(100, int(level)))
+        devices.lamp_on = devices.lamp_level > 0
 
     def _add_event(self, text: str):
         self.greenhouse.events.append(text)
